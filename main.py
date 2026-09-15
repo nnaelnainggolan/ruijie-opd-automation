@@ -13,8 +13,11 @@ import subprocess
 import sys
 import tempfile
 import time
-import urllib.error
-import urllib.request
+import zipfile
+import xml.etree.ElementTree as ET
+import queue
+import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -39,6 +42,21 @@ DATE_RANGE_PATTERN = re.compile(
     r"(?P<y2>20\d{2})\s*[/\-.]\s*(?P<m2>\d{1,2})\s*[/\-.]\s*(?P<d2>\d{1,2})",
     re.IGNORECASE,
 )
+
+
+@contextmanager
+def timed(stage: str):
+    started = time.perf_counter()
+    logging.info("Mulai: %s", stage)
+    try:
+        yield
+    finally:
+        logging.info("Durasi %s: %.2f detik", stage, time.perf_counter() - started)
+
+
+def file_version(path: Path):
+    stat = path.stat()
+    return stat.st_size, stat.st_mtime_ns
 
 
 def load_env_file(path: Path) -> None:
@@ -227,39 +245,25 @@ def run_ocr(image: Image.Image, settings: Settings) -> list[dict[str, str]]:
             text=True,
             encoding="utf-8",
             errors="replace",
+            timeout=45,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         if completed.returncode != 0:
             raise RuntimeError(f"Tesseract gagal: {completed.stderr.strip()[:300]}")
         return list(csv.DictReader(io.StringIO(completed.stdout), delimiter="\t"))
 
 
-def extract_end_date_and_crop(path: Path, settings: Settings) -> tuple[date, Path | None]:
+def extract_end_date_and_crop(path: Path, settings: Settings):
+    from screenshot_reader import analyze
     with Image.open(path) as source_image:
         source = source_image.convert("RGB")
-        words = run_ocr(source, settings)
-        text = " ".join(row.get("text", "") for row in words if row.get("text", "").strip())
-        match = DATE_RANGE_PATTERN.search(re.sub(r"\s+", "", text).upper())
-        if not match:
-            raise ValueError(f"Tanggal tidak terbaca dari screenshot. Hasil OCR: {text[:180]}")
-        end_date = date(int(match["y2"]), int(match["m2"]), int(match["d2"]))
-        if not settings.crop_speed_summary:
-            return end_date, None
-
-        y_values = []
-        for row in words:
-            token = row.get("text", "").strip().lower()
-            if token in {"speed", "summary"} or re.search(r"20\d{2}[/\-.]\d{1,2}", token):
-                try:
-                    y_values.append(int(row["top"]) // 2)
-                except (KeyError, TypeError, ValueError):
-                    pass
-        crop_top = max(0, min(y_values) - 12) if y_values else 0
-        cropped = source.crop((0, crop_top, source.width, source.height))
-        fd, temp_name = tempfile.mkstemp(prefix="opd_cropped_", suffix=".png")
+        info = analyze(run_ocr(source, settings), source.size)
+        cropped = source.crop(info["box"])
+        fd, name = tempfile.mkstemp(prefix="opd_cropped_", suffix=".png")
         os.close(fd)
-        temp_path = Path(temp_name)
+        temp_path = Path(name)
         cropped.save(temp_path)
-        return end_date, temp_path
+        return info["date"], temp_path, info["no_data"], info
 
 
 def report_filename(report_date: date) -> str:
@@ -281,92 +285,146 @@ def find_project_sheet(workbook: Any, project_name: str) -> Any:
     raise ValueError(f"Project {project_name!r} cocok dengan lebih dari satu sheet.")
 
 
+def project_sort_key(name: str) -> tuple:
+    match = re.match(r"^\s*(\d+)", name)
+    return (0, int(match.group(1)), name.strip().casefold()) if match else (1, 0, name.strip().casefold())
+
+
 def load_project_choices(report: Path) -> list[str]:
     """Ambil nama project langsung dari seluruh nama sheet file laporan."""
-    workbook = load_workbook(report, read_only=True, data_only=True)
-    try:
-        return [name.strip() for name in workbook.sheetnames if name.strip()]
-    finally:
-        workbook.close()
+    with zipfile.ZipFile(report) as archive:
+        root = ET.fromstring(archive.read("xl/workbook.xml"))
+    ns = {"s": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+    return sorted([sheet.attrib["name"] for sheet in root.findall("s:sheets/s:sheet", ns)], key=project_sort_key)
 
 
-def show_project_popup(projects: list[str], report: Path) -> tuple[str, str] | None:
-    """Tampilkan pilihan project dan jenis jaringan pada desktop Windows."""
-    try:
-        import tkinter as tk
-        from tkinter import messagebox, ttk
-    except ImportError as exc:
-        raise RuntimeError("Tkinter tidak tersedia pada instalasi Python ini.") from exc
-
+def show_project_popup(projects: list[str], report: Path, suggested: tuple[str, str] = ("", "")) -> tuple[str, str] | None:
+    """Grid project responsif tanpa dropdown atau scrollbar."""
+    import math
+    import tkinter as tk
+    projects = sorted(projects, key=project_sort_key)
     if not projects:
         raise ValueError(f"Tidak ada nama sheet pada {report.name}.")
-
-    result: dict[str, str] = {}
     root = tk.Tk()
-    root.title("Pilih Tujuan Screenshot OPD")
-    root.resizable(False, False)
+    root.title("OPD — Konfirmasi laporan")
+    root.configure(bg="#F1F5F9")
     root.attributes("-topmost", True)
+    sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+    width, height = min(1040, sw - 48), min(650, sh - 100)
+    root.geometry(f"{width}x{height}+{max(0,(sw-width)//2)}+{max(0,(sh-height)//2)}")
+    root.rowconfigure(1, weight=1)
+    root.columnconfigure(0, weight=1)
+    result = {}
+    selected = tk.StringVar(value=suggested[0] if suggested[0] in projects else "")
+    link = tk.StringVar(value=suggested[1] if suggested[1] in {"METRO", "BROADBAND"} else "")
+    project_buttons = []
+    network_buttons = []
 
-    frame = ttk.Frame(root, padding=20)
-    frame.grid(row=0, column=0, sticky="nsew")
-    ttk.Label(frame, text="Screenshot baru terdeteksi", font=("Segoe UI", 12, "bold")).grid(
-        row=0, column=0, columnspan=2, sticky="w", pady=(0, 5)
-    )
-    ttk.Label(frame, text=f"File laporan: {report.name}").grid(
-        row=1, column=0, columnspan=2, sticky="w", pady=(0, 16)
-    )
-    ttk.Label(frame, text="Nama project").grid(row=2, column=0, sticky="w", pady=5)
-    project_var = tk.StringVar(value=projects[0])
-    project_box = ttk.Combobox(
-        frame, textvariable=project_var, values=projects, state="readonly", width=42
-    )
-    project_box.grid(row=2, column=1, sticky="ew", pady=5)
+    header = tk.Frame(root, bg="white", padx=20, pady=12)
+    header.grid(row=0, column=0, sticky="ew")
+    tk.Label(header, text="Konfirmasi laporan", bg="white", fg="#0F172A",
+             font=("Segoe UI", 16, "bold")).pack(anchor="w")
+    tk.Label(header, text=f"{report.name}   •   {len(projects)} project   •   Periksa hasil deteksi di bawah",
+             bg="white", fg="#475569", font=("Segoe UI", 10)).pack(anchor="w", pady=(4,0))
 
-    ttk.Label(frame, text="Jenis jaringan").grid(row=3, column=0, sticky="nw", pady=8)
-    link_var = tk.StringVar(value="METRO")
-    link_frame = ttk.Frame(frame)
-    link_frame.grid(row=3, column=1, sticky="w", pady=5)
-    ttk.Radiobutton(link_frame, text="Metro", variable=link_var, value="METRO").pack(
-        side="left", padx=(0, 18)
-    )
-    ttk.Radiobutton(
-        link_frame, text="Broadband", variable=link_var, value="BROADBAND"
-    ).pack(side="left")
+    grid = tk.Frame(root, bg="#F1F5F9", padx=12, pady=8)
+    grid.grid(row=1, column=0, sticky="nsew")
+    footer = tk.Frame(root, bg="white", padx=20, pady=10)
+    footer.grid(row=2, column=0, sticky="ew")
+    footer.columnconfigure(0, weight=1)
+    summary = tk.Label(footer, text="Pilih satu project dan jenis jaringan.",
+                       bg="white", fg="#475569", font=("Segoe UI", 10), anchor="w")
+    summary.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0,10))
+    networks = tk.Frame(footer, bg="white")
+    networks.grid(row=1, column=0, sticky="w")
 
-    def submit() -> None:
-        if not project_var.get().strip():
-            messagebox.showwarning("Project belum dipilih", "Silakan pilih nama project.")
+    def refresh():
+        for name, button in project_buttons:
+            active = name == selected.get()
+            button.configure(bg="#E0E7FF" if active else "white",
+                             fg="#312E81" if active else "#1E293B",
+                             text=("✓  " if active else "   ") + name.strip(),
+                             relief="flat")
+        for name, button in network_buttons:
+            active = name == link.get()
+            button.configure(bg="#4338CA" if active else "#F1F5F9",
+                             fg="white" if active else "#334155")
+        ready = bool(selected.get() and link.get())
+        submit_button.configure(state="normal" if ready else "disabled",
+                                bg="#4338CA" if ready else "#E2E8F0")
+        summary.configure(text=(f"{selected.get().strip()}   /   {link.get() or 'Pilih jaringan'}"
+                                if selected.get() else "Pilih satu project dan jenis jaringan."))
+
+    def choose_project(name):
+        selected.set(name)
+        refresh()
+
+    for name in projects:
+        button = tk.Button(grid, text=name.strip(), anchor="w", justify="left",
+                           bg="white", fg="#1E293B", activebackground="#EEF2FF",
+                           activeforeground="#312E81", relief="flat", bd=0,
+                           highlightthickness=1, highlightbackground="#E2E8F0",
+                           highlightcolor="#4338CA",
+                           padx=8, pady=3, font=("Segoe UI", 10),
+                           cursor="hand2", command=lambda n=name: choose_project(n))
+        project_buttons.append((name,button))
+
+    def choose_link(name):
+        link.set(name)
+        refresh()
+
+    for name, label in [("METRO","Metro"),("BROADBAND","Broadband")]:
+        button = tk.Button(networks, text=label, font=("Segoe UI",11,"bold"),
+                           bg="#F1F5F9", fg="#334155", relief="flat",
+                           padx=14, pady=7, cursor="hand2",
+                           command=lambda n=name: choose_link(n))
+        button.pack(side="left", padx=(0,8))
+        network_buttons.append((name,button))
+
+    def submit():
+        if selected.get() in projects and link.get() in {"METRO","BROADBAND"}:
+            result.update(project=selected.get(), link=link.get())
+            root.destroy()
+
+    tk.Button(footer, text="Batal", command=root.destroy, bg="#E2E8F0",
+              fg="#334155", relief="flat", padx=18, pady=9,
+              font=("Segoe UI",11)).grid(row=1,column=1,padx=10)
+    submit_button = tk.Button(footer, text="Konfirmasi & simpan", command=submit,
+                              state="disabled", bg="#4338CA", fg="white",
+                              disabledforeground="#475569", relief="flat",
+                              padx=16,pady=8,font=("Segoe UI",11,"bold"))
+    submit_button.grid(row=1,column=2)
+    layout_state = [None]
+    def layout(event=None):
+        w, h = grid.winfo_width()-24, grid.winfo_height()-16
+        if w < 100 or h < 100:
             return
-        result["project"] = project_var.get().strip()
-        result["link"] = link_var.get()
-        root.destroy()
-
-    def cancel() -> None:
-        root.destroy()
-
-    buttons = ttk.Frame(frame)
-    buttons.grid(row=4, column=0, columnspan=2, sticky="e", pady=(18, 0))
-    ttk.Button(buttons, text="Batal", command=cancel).pack(side="left", padx=(0, 8))
-    ttk.Button(buttons, text="Proses", command=submit).pack(side="left")
-    root.protocol("WM_DELETE_WINDOW", cancel)
-    root.bind("<Escape>", lambda _event: cancel())
-    root.bind("<Return>", lambda _event: submit())
-    root.update_idletasks()
-    x = max(0, (root.winfo_screenwidth() - root.winfo_reqwidth()) // 2)
-    y = max(0, (root.winfo_screenheight() - root.winfo_reqheight()) // 2)
-    root.geometry(f"+{x}+{y}")
-    project_box.focus_set()
+        cols = max(3, min(6, math.ceil(len(projects) / max(1, h//44))))
+        rows = math.ceil(len(projects)/cols)
+        marker = (w,h,cols)
+        if layout_state[0] == marker:
+            return
+        layout_state[0] = marker
+        for c in range(6):
+            grid.columnconfigure(c,weight=1 if c<cols else 0, uniform="cards" if c<cols else "")
+        for r in range(len(projects)):
+            grid.rowconfigure(r,weight=1 if r<rows else 0)
+        for i, (_,button) in enumerate(project_buttons):
+            button.grid(row=i//cols,column=i%cols,sticky="nsew",padx=4,pady=3)
+            button.configure(wraplength=max(80,w//cols-32))
+    grid.bind("<Configure>",layout)
+    root.bind("<Escape>",lambda e:root.destroy())
+    root.bind("<Return>",lambda e:submit())
+    refresh()
     root.mainloop()
-    return (result["project"], result["link"]) if result else None
+    return (result["project"],result["link"]) if result else None
 
 
 def find_link_anchor(sheet: Any, link_type: str) -> str:
-    expected = f"LINK {link_type}"
-    for row in sheet.iter_rows():
-        for cell in row:
-            if isinstance(cell.value, str) and cell.value.strip().upper().startswith(expected):
-                return cell.coordinate
-    raise ValueError(f"Judul {expected} tidak ditemukan di sheet {sheet.title!r}.")
+    targets = {"BROADBAND": "A2", "METRO": "A18"}
+    if link_type not in targets:
+        raise ValueError(f"Jenis jaringan tidak dikenal: {link_type}")
+    return targets[link_type]
 
 
 def anchor_position(image: Any) -> tuple[int, int] | None:
@@ -376,7 +434,9 @@ def anchor_position(image: Any) -> tuple[int, int] | None:
 
 def protect_or_clear_slot(sheet: Any, anchor: str, allow_replace: bool) -> None:
     row, column = coordinate_to_tuple(anchor)
-    existing = [image for image in sheet._images if anchor_position(image) == (column, row)]
+    # Slot versi sebelumnya juga dilindungi agar gambar lama tidak bertumpuk.
+    positions = {(column, row), (column, row - 1)}
+    existing = [image for image in sheet._images if anchor_position(image) in positions]
     if existing and not allow_replace:
         raise FileExistsError(
             f"Slot {sheet.title}!{anchor} sudah memiliki gambar. ALLOW_REPLACE_EXISTING=false."
@@ -395,7 +455,7 @@ def calculate_size(path: Path, settings: Settings) -> tuple[int, int]:
 def create_backup(report: Path, settings: Settings) -> Path:
     folder = settings.backup_folder / datetime.now().strftime("%Y-%m-%d")
     folder.mkdir(parents=True, exist_ok=True)
-    destination = folder / f"{report.stem}_{datetime.now():%H%M%S}.xlsx"
+    destination = folder / f"{report.stem}_{datetime.now():%H%M%S_%f}.xlsx"
     shutil.copy2(report, destination)
     return destination
 
@@ -405,24 +465,27 @@ def insert_into_drive_report(
     settings: Settings,
     selection: tuple[str, str] | None = None,
 ) -> dict[str, Any] | None:
-    report_date, cropped_path = extract_end_date_and_crop(path, settings)
+    with timed("OCR tanggal dan pemotongan"):
+        report_date, cropped_path, no_data, detected = extract_end_date_and_crop(path, settings)
     image_path = cropped_path or path
     report = settings.drive_report_folder / report_filename(report_date)
     try:
         if not report.exists():
             raise FileNotFoundError(f"File laporan tidak ditemukan: {report}")
         if selection is None:
-            try:
-                project, link_type = parse_screenshot_filename(path)
-            except ValueError:
-                selection = show_project_popup(load_project_choices(report), report)
-                if selection is None:
-                    logging.info("Pemilihan dibatalkan: %s", path.name)
-                    return None
-                project, link_type = selection
-        else:
-            project, link_type = selection
-        workbook = load_workbook(report)
+            from screenshot_reader import suggest_selection
+            projects = load_project_choices(report)
+            suggested = suggest_selection(detected, projects)
+            logging.info("Saran OCR: %s | %s. Menunggu konfirmasi popup.",
+                         suggested[0] or "belum terbaca", suggested[1] or "belum terbaca")
+            selection = show_project_popup(projects, report, suggested)
+            if selection is None:
+                logging.info("Pemilihan dibatalkan: %s", path.name)
+                return None
+        project, link_type = selection
+        baseline = file_version(report)
+        with timed("Membuka Excel"):
+            workbook = load_workbook(report)
         sheet = find_project_sheet(workbook, project)
         anchor = find_link_anchor(sheet, link_type)
         protect_or_clear_slot(sheet, anchor, settings.allow_replace_existing)
@@ -432,15 +495,35 @@ def insert_into_drive_report(
         excel_image.width, excel_image.height = width, height
         sheet.add_image(excel_image, anchor)
 
-        backup = create_backup(report, settings)
-        fd, temp_name = tempfile.mkstemp(prefix="opd_saving_", suffix=".xlsx", dir=report.parent)
+        with timed("Backup"):
+            backup = create_backup(report, settings)
+        fd, temp_name = tempfile.mkstemp(prefix="opd_saving_", suffix=".xlsx")
         os.close(fd)
         temp_path = Path(temp_name)
         try:
-            workbook.save(temp_path)
-            verification = load_workbook(temp_path)
-            verification.close()
-            os.replace(temp_path, report)
+            with timed("Menyimpan Excel di disk lokal"):
+                workbook.save(temp_path)
+            with timed("Verifikasi arsip Excel"):
+                with zipfile.ZipFile(temp_path) as archive:
+                    bad = archive.testzip()
+                    if bad:
+                        raise ValueError(f"Arsip Excel rusak: {bad}")
+                    ET.fromstring(archive.read("xl/workbook.xml"))
+            with timed("Menyalin hasil ke folder Drive"):
+                if file_version(report) != baseline:
+                    raise RuntimeError("File tujuan berubah selama proses. Ulangi screenshot agar perubahan tidak tertimpa.")
+                transfer_fd, transfer_name = tempfile.mkstemp(
+                    prefix="opd_transfer_", suffix=".xlsx", dir=report.parent)
+                os.close(transfer_fd)
+                transfer = Path(transfer_name)
+                try:
+                    shutil.copyfile(temp_path, transfer)
+                    if file_version(report) != baseline:
+                        raise RuntimeError("File tujuan berubah saat transfer. Silakan ulangi.")
+                    os.replace(transfer, report)
+                finally:
+                    transfer.unlink(missing_ok=True)
+            logging.info("Excel tersimpan. Status sinkronisasi online diperiksa melalui aplikasi Google Drive.")
         except PermissionError as exc:
             raise PermissionError(
                 f"File {report.name} sedang dibuka di Excel. Tutup file lalu coba lagi."
@@ -449,6 +532,7 @@ def insert_into_drive_report(
             temp_path.unlink(missing_ok=True)
 
         return {
+            "status": "no_data" if no_data else "normal",
             "project": project,
             "link_type": link_type,
             "report_date": report_date.isoformat(),
@@ -458,6 +542,7 @@ def insert_into_drive_report(
             "cell": anchor,
             "backup": str(backup),
             "image": path.name,
+            "image_path": str(path.resolve()),
         }
     finally:
         if cropped_path:
@@ -473,57 +558,90 @@ def notification_text(result: dict[str, Any]) -> str:
     )
 
 
-def post_json(url: str, payload: dict[str, Any], headers: dict[str, str]) -> None:
-    request = urllib.request.Request(
-        url, data=json.dumps(payload, ensure_ascii=False).encode(), method="POST"
-    )
-    request.add_header("Content-Type", "application/json")
-    for name, value in headers.items():
-        request.add_header(name, value)
+def alert_popup(result: dict[str, Any]) -> None:
+    import tkinter as tk
+    from PIL import ImageTk
+    from clipboard_helper import copy_content
+    root = tk.Tk()
+    root.title("OPD • No Data — Siap disalin ke WhatsApp")
+    root.configure(bg="#F1F5F9")
+    sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+    w, h = min(1100, sw-40), min(760, sh-90)
+    root.geometry(f"{w}x{h}+{max(0,(sw-w)//2)}+{max(0,(sh-h)//2)}")
+    root.columnconfigure(0, weight=3)
+    root.columnconfigure(1, weight=2)
+    root.rowconfigure(1, weight=1)
+    tk.Label(root, text="No Data terdeteksi • Laporan siap dibagikan",
+             bg="#0F2942", fg="white", font=("Segoe UI", 17, "bold"),
+             padx=20, pady=16, anchor="w").grid(row=0,column=0,columnspan=2,sticky="ew")
+    preview = tk.Label(root, bg="#DDE5EE", text="Screenshot asli tidak tersedia.")
+    preview.grid(row=1,column=0,sticky="nsew",padx=(16,8),pady=16)
+    original = None
     try:
-        with urllib.request.urlopen(request, timeout=20) as response:
-            if not 200 <= response.status < 300:
-                raise RuntimeError(f"HTTP {response.status}")
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode(errors="replace")[:500]
-        raise RuntimeError(f"HTTP {exc.code}: {detail}") from exc
+        with Image.open(result["image_path"]) as source:
+            original = source.copy()
+    except (OSError, KeyError) as exc:
+        logging.warning("Tidak dapat membuka screenshot asli: %s", exc)
+    def render(event=None):
+        if original is None:
+            return
+        image = original.copy()
+        image.thumbnail((max(1,preview.winfo_width()-16),
+                         max(1,preview.winfo_height()-16)), Image.Resampling.LANCZOS)
+        preview.photo = ImageTk.PhotoImage(image, master=root)
+        preview.configure(image=preview.photo,text="")
+    preview.bind("<Configure>",render)
+    right = tk.Frame(root,bg="white",padx=16,pady=16)
+    right.grid(row=1,column=1,sticky="nsew",padx=(8,16),pady=16)
+    right.rowconfigure(1,weight=1)
+    right.columnconfigure(0,weight=1)
+    tk.Label(right,text="Pesan (bisa diedit sebelum disalin)",font=("Segoe UI",11,"bold"),
+             bg="white",fg="#16324F").grid(row=0,column=0,sticky="w",pady=(0,10))
+    message = tk.Text(right,wrap="word",font=("Segoe UI",11),relief="flat",
+                      bg="#F8FAFC",fg="#16324F",padx=12,pady=12,width=32,height=8)
+    message.grid(row=1,column=0,sticky="nsew")
+    message.insert("1.0",(
+        f"PERINGATAN NO DATA OPD\n\nProject: {result['project'].strip()}\n"
+        f"Jaringan: {result['link_type']}\nTanggal laporan: {result['report_date']}\n\n"
+        "Ruijie menampilkan No Data pada periode tersebut.\nMohon dilakukan pemeriksaan jaringan."
+    ))
+    status = tk.StringVar(value="Belum dikirim. Anda memilih penerima dan mengirim sendiri di WhatsApp.")
+    def copy(mode):
+        try:
+            root.update_idletasks()
+            copy_content(root.winfo_id(),
+                         text=message.get("1.0","end-1c") if mode != "image" else None,
+                         image_path=result["image_path"] if mode != "text" else None)
+            if mode == "both":
+                status.set("Pesan dan gambar disalin. Tempel di WhatsApp. Jika caption kosong, klik Salin Pesan lalu tempel pada caption.")
+            else:
+                status.set("Pesan disalin." if mode == "text" else "Screenshot asli utuh disalin.")
+        except Exception as exc:
+            status.set(f"Gagal menyalin: {exc}")
+    tk.Button(right,text="Salin Pesan + Screenshot",command=lambda:copy("both"),
+              state="normal" if original else "disabled",bg="#126B69",fg="white",
+              font=("Segoe UI",11,"bold"),relief="flat",pady=12).grid(row=2,column=0,sticky="ew",pady=(16,6))
+    extra = tk.Frame(right,bg="white")
+    extra.grid(row=3,column=0,sticky="ew")
+    tk.Button(extra,text="Salin Pesan",command=lambda:copy("text"),pady=8).pack(side="left",fill="x",expand=True,padx=(0,4))
+    tk.Button(extra,text="Salin Screenshot",command=lambda:copy("image"),
+              state="normal" if original else "disabled",pady=8).pack(side="left",fill="x",expand=True)
+    tk.Label(root,textvariable=status,bg="#F1F5F9",fg="#334155",wraplength=w-60,
+             font=("Segoe UI",10),padx=20,pady=8,justify="left").grid(row=2,column=0,columnspan=2,sticky="ew")
+    tk.Button(root,text="Tutup",command=root.destroy,padx=24,pady=8).grid(
+        row=3,column=0,columnspan=2,pady=(0,12))
+    root.bind("<Escape>",lambda e:root.destroy())
+    root.lift()
+    root.mainloop()
 
 
 def send_notification(settings: Settings, result: dict[str, Any]) -> None:
-    mode = settings.notification_mode
-    payload = {
-        "event": "opd_screenshot_inserted", "status": "success",
-        "message": "Screenshot berhasil dimasukkan ke laporan OPD.", **result,
-    }
-    if mode == "console":
-        logging.info("NOTIFIKASI\n%s", notification_text(result))
-    elif mode == "n8n":
-        if not settings.n8n_webhook_url:
-            raise RuntimeError("N8N_WEBHOOK_URL belum diisi.")
-        headers = ({"Authorization": f"Bearer {settings.n8n_webhook_token}"}
-                   if settings.n8n_webhook_token else {})
-        post_json(settings.n8n_webhook_url, payload, headers)
-        logging.info("Notifikasi berhasil dikirim ke n8n.")
-    elif mode == "whatsapp_cloud":
-        required = {
-            "WHATSAPP_ACCESS_TOKEN": settings.whatsapp_access_token,
-            "WHATSAPP_PHONE_NUMBER_ID": settings.whatsapp_phone_number_id,
-            "WHATSAPP_TO": settings.whatsapp_to,
-        }
-        missing = [key for key, value in required.items() if not value]
-        if missing:
-            raise RuntimeError(f"Konfigurasi WhatsApp belum lengkap: {', '.join(missing)}")
-        url = (f"https://graph.facebook.com/{settings.whatsapp_api_version}/"
-               f"{settings.whatsapp_phone_number_id}/messages")
-        body = {
-            "messaging_product": "whatsapp", "recipient_type": "individual",
-            "to": settings.whatsapp_to, "type": "text",
-            "text": {"preview_url": False, "body": notification_text(result)},
-        }
-        post_json(url, body, {"Authorization": f"Bearer {settings.whatsapp_access_token}"})
-        logging.info("Notifikasi berhasil dikirim melalui WhatsApp Cloud API.")
-    else:
-        raise RuntimeError("NOTIFICATION_MODE harus console, n8n, atau whatsapp_cloud.")
+    # Legacy .env mode/credentials intentionally have no effect: no network sends.
+    if result.get("status") != "no_data":
+        logging.info("Screenshot tersimpan. Tidak ada peringatan No Data.")
+        return
+    logging.info("NO DATA: %s. Membuka popup salin manual.", result["project"])
+    alert_popup(result)
 
 
 def process_file(path: Path, settings: Settings, state: StateStore) -> None:
@@ -551,6 +669,8 @@ def process_file(path: Path, settings: Settings, state: StateStore) -> None:
             send_notification(settings, result)
         except Exception:
             logging.exception("Gambar masuk ke Drive, tetapi notifikasi gagal.")
+    except ValueError as exc:
+        logging.warning("Screenshot perlu diperiksa: %s", exc)
     except FileExistsError as exc:
         logging.warning(
             "NOTIFIKASI DUPLIKAT / SLOT SUDAH TERISI\n"
@@ -572,24 +692,52 @@ def watch(settings: Settings, state: StateStore) -> None:
 
     logging.info("Memantau screenshot: %s", settings.screenshot_folder)
     logging.info("Folder laporan Drive: %s", settings.drive_report_folder)
-    logging.info("Mode notifikasi: %s", settings.notification_mode)
+    logging.info("Mode notifikasi: popup salin manual (tanpa pengiriman otomatis)")
     logging.info("Tekan Ctrl+C untuk berhenti.")
-    seen = {
-        path.resolve() for path in settings.screenshot_folder.iterdir()
-        if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS
-    }
+    pending = queue.Queue()
+    stop = threading.Event()
+
+    def scan():
+        result = {}
+        for path in settings.screenshot_folder.iterdir():
+            if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS:
+                try:
+                    result[path.resolve()] = file_version(path)
+                except OSError:
+                    continue
+        return result
+
+    initial = scan()
+    def collect():
+        seen = initial
+        while not stop.wait(0.4):
+            try:
+                current = scan()
+                for path, signature in current.items():
+                    if seen.get(path) != signature:
+                        pending.put(path)
+                        logging.info("Antrean screenshot: %s (menunggu %s)", path.name, pending.qsize())
+                seen = current
+            except OSError as exc:
+                logging.warning("Folder belum dapat dibaca: %s", exc)
+
+    worker = threading.Thread(target=collect, daemon=True)
+    worker.start()
     try:
         while True:
-            current = {
-                path.resolve() for path in settings.screenshot_folder.iterdir()
-                if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS
-            }
-            for path in sorted(current - seen, key=lambda item: item.stat().st_mtime_ns):
+            try:
+                path = pending.get(timeout=0.4)
+            except queue.Empty:
+                continue
+            try:
                 process_file(path, settings, state)
-            seen = current
-            time.sleep(1)
+            finally:
+                pending.task_done()
     except KeyboardInterrupt:
-        logging.info("Program dihentikan.")
+        logging.info("Program dihentikan. Antrean belum selesai: %s. Gunakan --once untuk mengulang file lama.", pending.qsize())
+    finally:
+        stop.set()
+        worker.join(timeout=2)
 
 
 def parse_args() -> argparse.Namespace:
