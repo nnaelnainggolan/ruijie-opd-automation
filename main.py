@@ -750,6 +750,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     setup_logging()
+    logging.info("OPD v14 — deteksi project dan konfirmasi otomatis")
     try:
         settings = Settings.from_env()
         state = StateStore(PROJECT_DIR / "data" / "state.json")

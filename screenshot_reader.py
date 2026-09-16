@@ -27,7 +27,9 @@ def analyze(words, size):
     start,end=date(*vals[:3]),date(*vals[3:])
     if end<start: raise ValueError("Rentang tanggal OCR tidak valid.")
     top=min(t["y"] for t in title)
-    candidates={t["text"].strip("•●:") for t in tokens if t["y"]<top and t["conf"]>=75
+    # Header suggestions require a unique sheet match and user confirmation.
+    # Correct device headers can have low OCR confidence (WAGUBSU: 43.66).
+    candidates={t["text"].strip("•●:") for t in tokens if t["y"]<top and t["conf"]>=0
                 and re.fullmatch(r"\d{1,3}[-–][A-Za-z0-9]+(?:[-–][A-Za-z0-9]+)+",t["text"].strip("•●:"))}
     links=set()
     for desc in tokens:
@@ -44,18 +46,28 @@ def analyze(words, size):
     box=(max(0,int(min(t["x"] for t in title))-8),max(0,int(top)-12),size[0],min(size[1],int(bottom)))
     return {"date":end,"box":box,"no_data":bool(empty),"projects":candidates,"links":links}
 
-def resolve_selection(info,sheets):
-    if len(info["projects"])!=1 or len(info["links"])!=1: return None
-    matches=[n for n in sheets if norm(n)==norm(next(iter(info["projects"])))]
-    return (matches[0],next(iter(info["links"]))) if len(matches)==1 else None
+# Explicit alias verified against the supplied device and workbook screenshots.
+# Do not match by project number alone: different devices may share a prefix.
+PROJECT_ALIASES = {
+    norm("03-RG-WAGUBSU-SERVER"): norm("03-RUDIN WAGUBSU"),
+}
 
 
 def suggest_selection(info, sheets):
-    """Prefill independently; uncertain fields stay empty."""
+    """Return a unique exact/verified-alias suggestion; never choose by number only."""
     project = ""
     if len(info["projects"]) == 1:
-        matches = [name for name in sheets if norm(name) == norm(next(iter(info["projects"])))]
+        candidate = norm(next(iter(info["projects"])))
+        matches = [name for name in sheets if norm(name) == candidate]
+        if not matches and candidate in PROJECT_ALIASES:
+            matches = [name for name in sheets
+                       if norm(name) == PROJECT_ALIASES[candidate]]
         if len(matches) == 1:
             project = matches[0]
     link = next(iter(info["links"])) if len(info["links"]) == 1 else ""
     return project, link
+
+
+def resolve_selection(info, sheets):
+    project, link = suggest_selection(info, sheets)
+    return (project, link) if project and link else None
